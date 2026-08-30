@@ -1,4 +1,24 @@
 #!/system/bin/sh
+# Robust bootroot — per-mount timeout, retry, and overall deadline to avoid hangs.
+
+# Overall deadline for the entire script (seconds). Prevents a stuck mount from
+# blocking app startup indefinitely.  90 s gives slow kernels plenty of room.
+BOOTROOT_DEADLINE=${BOOTROOT_DEADLINE:-90}
+_bootroot_start=$(date +%s 2>/dev/null || echo 0)
+
+_bootroot_time_left() {
+    local now=$(date +%s 2>/dev/null || echo 0)
+    local elapsed=$(( now - _bootroot_start ))
+    local remaining=$(( BOOTROOT_DEADLINE - elapsed ))
+    [ "$remaining" -gt 0 ] && echo "$remaining" || echo 1
+}
+
+# Per-mount timeout (seconds).  Individual mounts that hang this long are
+# aborted and retried once before being skipped.
+MOUNT_TIMEOUT=${MOUNT_TIMEOUT:-15}
+
+# Retry count for transient mount failures.
+MOUNT_RETRIES=${MOUNT_RETRIES:-1}
 
 SELF_PATH=$(readlink -f "$0")
 . "${SELF_PATH%/*}/bootroot_env"
@@ -28,6 +48,8 @@ f_isAllReady(){
         return 1
     done
     [ ! -e "/dev/net/tun" ] && return 1
+    [ ! -e "/dev/urandom" -o ! -e "/dev/random" ] && return 1
+    [ ! -e "$MNT/dev/urandom" -o ! -e "$MNT/dev/random" ] && return 1
     [ ! -e "/dev/fd" -o ! -e "/dev/stdin" -o ! -e "/dev/stdout" -o ! -e "/dev/stderr" ] && return 1
     echo "[+] The Chroot has been started already." && return 0
 }
@@ -84,44 +106,147 @@ f_mount_fs() {
     if ! $BUSYBOX mountpoint -q "$MNT/dev"; then
         [ -d "$MNT/dev" ] && rm -rf "$MNT/dev"
         mkdir -p "$MNT/dev"
-        $BUSYBOX mount -o bind /dev "$MNT/dev" && echo "[+] mounted /dev"
+        _attempt=0
+        _mounted_dev=false
+        while [ "$_attempt" -le "$MOUNT_RETRIES" ]; do
+            remaining=$(_bootroot_time_left)
+            if timeout "$remaining" $BUSYBOX mount -o bind /dev "$MNT/dev" 2>/dev/null; then
+                echo "[+] mounted /dev"
+                _mounted_dev=true
+                break
+            fi
+            _attempt=$(( _attempt + 1 ))
+            echo "[!] /dev mount attempt $_attempt failed, retrying…"
+            sleep 1
+        done
+        if [ "$_mounted_dev" = false ]; then
+            echo "[!] WARNING: /dev mount failed after $((MOUNT_RETRIES+1)) attempts — continuing anyway"
+        fi
     fi
+
+    ######### SET URANDOM/RANDOM FIX (proot git clone fix) ########
+    # Host /dev may be incomplete on some Android/KernelSU setups; ensure char devices exist before and after bind
+    for devnode in "/dev/urandom c 1 9" "/dev/random c 1 8" "/dev/null c 1 3"; do
+        set -- $devnode
+        [ -c "$1" ] || { mknod "$1" c "$2" "$3" 2>/dev/null && echo "[+] created $1"; }
+        chmod 666 "$1" 2>/dev/null
+    done
+    for devnode in "$MNT/dev/urandom c 1 9" "$MNT/dev/random c 1 8" "$MNT/dev/null c 1 3"; do
+        set -- $devnode
+        [ -c "$1" ] || { mknod "$1" c "$2" "$3" 2>/dev/null && echo "[+] created $1 (chroot)"; }
+        chmod 666 "$1" 2>/dev/null
+    done
 
     ######### SET DEV PTS ########
     if ! $BUSYBOX mountpoint -q "$MNT/dev/pts"; then
         mkdir -p "$MNT/dev/pts"
-        $BUSYBOX mount -t devpts devpts "$MNT/dev/pts" && echo "[+] mounted /dev/pts"
+        _attempt=0
+        while [ "$_attempt" -le "$MOUNT_RETRIES" ]; do
+            remaining=$(_bootroot_time_left)
+            if timeout "$remaining" $BUSYBOX mount -t devpts devpts "$MNT/dev/pts" 2>/dev/null; then
+                echo "[+] mounted /dev/pts"
+                break
+            fi
+            _attempt=$(( _attempt + 1 ))
+            echo "[!] /dev/pts mount attempt $_attempt failed, retrying…"
+            sleep 1
+        done
     fi
 
     ######### SET DEV SHM ########
     if ! $BUSYBOX mountpoint -q "$MNT/dev/shm"; then
         mkdir -p "$MNT/dev/shm"
-        $BUSYBOX mount -o rw,nosuid,nodev,mode=1777 -t tmpfs tmpfs "$MNT/dev/shm" && echo "[+] mounted /dev/shm"
+        _attempt=0
+        while [ "$_attempt" -le "$MOUNT_RETRIES" ]; do
+            remaining=$(_bootroot_time_left)
+            if timeout "$remaining" $BUSYBOX mount -o rw,nosuid,nodev,mode=1777 -t tmpfs tmpfs "$MNT/dev/shm" 2>/dev/null; then
+                echo "[+] mounted /dev/shm"
+                break
+            fi
+            _attempt=$(( _attempt + 1 ))
+            echo "[!] /dev/shm mount attempt $_attempt failed, retrying…"
+            sleep 1
+        done
     fi
 
     ######### SET PROC ########
     if ! $BUSYBOX mountpoint -q "$MNT/proc"; then
         [ -d "$MNT/proc" ] && rm -rf "$MNT/proc"
         mkdir -p "$MNT/proc"
-        $BUSYBOX mount -t proc proc "$MNT/proc" && echo "[+] mounted /proc"
+        _attempt=0
+        _mounted_proc=false
+        while [ "$_attempt" -le "$MOUNT_RETRIES" ]; do
+            remaining=$(_bootroot_time_left)
+            if timeout "$remaining" $BUSYBOX mount -t proc proc "$MNT/proc" 2>/dev/null; then
+                echo "[+] mounted /proc"
+                _mounted_proc=true
+                break
+            fi
+            _attempt=$(( _attempt + 1 ))
+            echo "[!] /proc mount attempt $_attempt failed, retrying…"
+            sleep 1
+        done
+        if [ "$_mounted_proc" = false ]; then
+            echo "[!] WARNING: /proc mount failed — chroot will be partially broken"
+        fi
     fi
 
     ######### SET SYS ########
     if ! $BUSYBOX mountpoint -q "$MNT/sys"; then
         [ -d "$MNT/sys" ] && rm -rf "$MNT/sys"
         mkdir -p "$MNT/sys"
-        $BUSYBOX mount -t sysfs sys "$MNT/sys" && echo "[+] mounted /sys"
+        _attempt=0
+        while [ "$_attempt" -le "$MOUNT_RETRIES" ]; do
+            remaining=$(_bootroot_time_left)
+            if timeout "$remaining" $BUSYBOX mount -t sysfs sys "$MNT/sys" 2>/dev/null; then
+                echo "[+] mounted /sys"
+                break
+            fi
+            _attempt=$(( _attempt + 1 ))
+            echo "[!] /sys mount attempt $_attempt failed, retrying…"
+            sleep 1
+        done
     fi
 
     ######### SET SYSTEM ########
     if ! $BUSYBOX mountpoint -q "$MNT/system"; then
         [ -d "$MNT/system" ] && rm -rf "$MNT/system"
         mkdir -p "$MNT/system"
-        $BUSYBOX mount -o bind /system "$MNT/system" && echo "[+] mounted /system"
+        _attempt=0
+        while [ "$_attempt" -le "$MOUNT_RETRIES" ]; do
+            remaining=$(_bootroot_time_left)
+            if timeout "$remaining" $BUSYBOX mount -o bind /system "$MNT/system" 2>/dev/null; then
+                echo "[+] mounted /system"
+                break
+            fi
+            _attempt=$(( _attempt + 1 ))
+            echo "[!] /system mount attempt $_attempt failed, retrying…"
+            sleep 1
+        done
     fi
 
-    ######### SET INTERNAL SDCARD ########
-    f_mount_sdcard
+    ######### SET INTERNAL SDCARD (with retry) ########
+    _sdcard_ok=false
+    _attempt=0
+    while [ "$_attempt" -le "$MOUNT_RETRIES" ]; do
+        if f_mount_sdcard; then _sdcard_ok=true; break; fi
+        _attempt=$(( _attempt + 1 ))
+        echo "[!] sdcard mount attempt $_attempt failed, retrying…"
+        sleep 1
+    done
+    if [ "$_sdcard_ok" = false ]; then
+        echo "[!] WARNING: sdcard/Stryker bind failed — some features may be unavailable"
+    fi
+
+    ######### FIX WORKSPACE PERMS (reverse-engineer) ########
+    if [ -d "$MNT/home/arman/workspace/projects/reverse-engineer" ]; then
+        chown -R 1001:1001 "$MNT/home/arman/workspace/projects/reverse-engineer" 2>/dev/null && echo "[+] fixed reverse-engineer owner"
+        chmod -R 755 "$MNT/home/arman/workspace/projects/reverse-engineer" 2>/dev/null
+    fi
+    if [ -d "$MNT/home/arman/workspace/repository" ]; then
+        chown -R 1001:1001 "$MNT/home/arman/workspace/repository" 2>/dev/null
+        chmod -R 755 "$MNT/home/arman/workspace/repository" 2>/dev/null
+    fi
 
     ######### SET 250MB TO ALLOW POSTGRESQL #########
     $BUSYBOX sysctl -w kernel.shmmax=268435456
@@ -159,7 +284,8 @@ f_mount_fs() {
     fi
 
     ######### Setup done #########
-    echo "[+] The Chroot has been started."
+    _elapsed=$(( $(date +%s 2>/dev/null || echo 0) - _bootroot_start ))
+    echo "[+] The Chroot has been started. (${_elapsed}s)"
 }
 
 ################################

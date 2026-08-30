@@ -1,1 +1,59 @@
-su -c "/data/data/com.zalexdev.stryker/files/bash_exec"
+#!/system/bin/sh
+# Stryker global entry — callable as `stryker` from any terminal
+# Fixes mounting (urandom, dev, etc.) then enters chroot, so both app and manual terminal are error-free
+
+set -e
+
+SELF_PATH=$(readlink -f "$0" 2>/dev/null || echo "$0")
+
+# Try multiple locations for bootroot_env (installed vs source)
+for p in "${SELF_PATH%/*}/bootroot_env" "/data/data/com.zalexdev.stryker/files/bootroot_env" "/data/local/stryker/release/../bootroot_env"; do
+  [ -f "$p" ] && . "$p" && break
+done
+# If still not loaded, try default
+[ -z "$MNT" ] && . /data/data/com.zalexdev.stryker/files/bootroot_env 2>/dev/null || {
+    echo "[-] Cannot load bootroot_env — is Stryker installed?"
+    exit 1
+}
+
+# Validate busybox is usable
+if [ ! -x "$BUSYBOX" ]; then
+    echo "[-] Busybox not found or not executable at: $BUSYBOX"
+    exit 1
+fi
+
+# Ensure mounts are ready (reuse bootroot logic without re-mounting if already mounted)
+if [ -x "$BUSYBOX" ] && [ -n "$MNT" ]; then
+  # Host /dev fix (urandom, random, null)
+  for devnode in "/dev/urandom c 1 9" "/dev/random c 1 8" "/dev/null c 1 3"; do
+    set -- $devnode; [ -c "$1" ] || mknod "$1" c "$2" "$3" 2>/dev/null
+    chmod 666 "$1" 2>/dev/null
+  done
+
+  # Trigger bootroot mount check if needed — with timeout to avoid hang
+  if [ -x "/data/data/com.zalexdev.stryker/files/bootroot" ]; then
+    timeout 90 /data/data/com.zalexdev.stryker/files/bootroot 2>&1 || {
+      echo "[!] bootroot mount check failed or timed out — continuing anyway"
+    }
+  fi
+
+  # Chroot dev fix after bind
+  for devnode in "$MNT/dev/urandom c 1 9" "$MNT/dev/random c 1 8" "$MNT/dev/null c 1 3"; do
+    set -- $devnode; [ -c "$1" ] || mknod "$1" c "$2" "$3" 2>/dev/null
+    chmod 666 "$1" 2>/dev/null
+  done
+fi
+
+# Enter chroot — preserve args, default to login shell
+if [ -x "/data/data/com.zalexdev.stryker/files/bash_exec" ]; then
+  exec su -c "/data/data/com.zalexdev.stryker/files/bash_exec $*"
+else
+  # Fallback direct chroot — validate MNT exists first
+  if [ ! -d "$MNT" ]; then
+    echo "[-] Chroot directory not found: $MNT"
+    echo "[-] Run the Stryker installer first."
+    exit 1
+  fi
+  SELF_PATH=$(readlink -f "$0"); . "${SELF_PATH%/*}/bootroot_env" 2>/dev/null
+  exec $BUSYBOX chroot "$MNT" /usr/bin/env -i HOME=/root USER=root LOGNAME=root SHELL="$CHROOT_SHELL" TERM="${TERM:-xterm-256color}" LANG=C.UTF-8 LC_ALL=C.UTF-8 PATH="$CHROOT_PATH" "$CHROOT_SHELL" -l "$@"
+fi
